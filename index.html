@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TicketMaster MVP</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .ticket-code {
+            font-family: 'Courier New', monospace;
+            letter-spacing: 1px;
+        }
+        .flash-enter {
+            animation: slideDown 0.3s ease-out;
+        }
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body>
+
+<div x-data="app()" class="min-h-screen bg-gray-50">
+
+    <!-- ===== NAVBAR ===== -->
+    <nav class="bg-blue-700 text-white shadow-lg">
+        <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+            <a href="#" @click="view = 'events'" class="text-xl font-bold tracking-tight cursor-pointer">
+                🎫 TicketMaster MVP
+            </a>
+            <div class="space-x-4 text-sm font-medium">
+                <template x-if="!organizer">
+                    <span>
+                        <a href="#" @click="view = 'org-login'" class="hover:underline">Organizer Login</a>
+                        <a href="#" @click="view = 'org-register'" class="hover:underline ml-3">Register</a>
+                    </span>
+                </template>
+                <template x-if="organizer">
+                    <span>
+                        <a href="#" @click="view = 'org-dashboard'" class="hover:underline">Dashboard</a>
+                        <a href="#" @click="view = 'checkin'" class="hover:underline">Check-in</a>
+                        <a href="#" @click="logout()" class="hover:underline ml-3">Logout (<span x-text="organizer.name"></span>)</a>
+                    </span>
+                </template>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ===== FLASH MESSAGES ===== -->
+    <template x-for="(msg, i) in flashes" :key="i">
+        <div class="max-w-6xl mx-auto px-4 mt-3">
+            <div class="flash-enter px-4 py-3 rounded-lg text-sm font-medium"
+                 :class="msg.type === 'success' ? 'bg-green-100 text-green-800 border border-green-300' : 'bg-red-100 text-red-800 border border-red-300'">
+                <span x-text="msg.text"></span>
+                <button @click="flashes.splice(i,1)" class="float-right font-bold">&times;</button>
+            </div>
+        </div>
+    </template>
+
+    <div class="max-w-6xl mx-auto px-4 py-6">
+
+        <!-- ===== VIEW: EVENTS LIST ===== -->
+        <template x-if="view === 'events'">
+            <div>
+                <h1 class="text-2xl font-bold mb-4">Upcoming Events</h1>
+                <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <template x-for="evt in events" :key="evt.id">
+                        <div class="bg-white rounded-xl shadow p-5 border border-gray-200">
+                            <h2 class="text-lg font-bold" x-text="evt.title"></h2>
+                            <p class="text-gray-600 text-sm mt-1">📍 <span x-text="evt.venue"></span></p>
+                            <p class="text-gray-600 text-sm">📅 <span x-text="evt.date"></span> @ <span x-text="evt.time"></span></p>
+                            <p class="text-gray-500 text-xs mt-2">by <span x-text="evt.organizer_name"></span></p>
+                            <button @click="viewEvent(evt.id)" class="mt-3 w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-sm font-medium transition">
+                                View Tickets
+                            </button>
+                        </div>
+                    </template>
+                </div>
+                <template x-if="events.length === 0">
+                    <div class="bg-white rounded-xl shadow p-8 text-center text-gray-500">
+                        <p class="text-lg">No events yet.</p>
+                        <template x-if="organizer">
+                            <button @click="view = 'create-event'" class="mt-3 bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg">Create Your First Event</button>
+                        </template>
+                        <template x-if="!organizer">
+                            <p class="text-sm mt-2"><a href="#" @click="view = 'org-register'" class="text-blue-600 underline">Register as an organizer</a> to create events.</p>
+                        </template>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: EVENT DETAIL ===== -->
+        <template x-if="view === 'event-detail'">
+            <div>
+                <button @click="view = 'events'" class="text-blue-600 hover:underline text-sm mb-3">&larr; Back to Events</button>
+                <div class="bg-white rounded-xl shadow p-6 border border-gray-200">
+                    <h1 class="text-2xl font-bold" x-text="currentEvent.title"></h1>
+                    <p class="text-gray-600 mt-1" x-text="currentEvent.description || ''"></p>
+                    <hr class="my-3">
+                    <p><strong>📍 Venue:</strong> <span x-text="currentEvent.venue"></span></p>
+                    <p><strong>📅 Date:</strong> <span x-text="currentEvent.date"></span> @ <span x-text="currentEvent.time"></span></p>
+                    <p><strong>👤 Organized by:</strong> <span x-text="currentEvent.organizer_name"></span></p>
+                </div>
+
+                <h2 class="text-xl font-bold mt-6 mb-3">Available Tickets</h2>
+
+                <template x-for="tier in currentTiers" :key="tier.id">
+                    <div class="bg-white rounded-xl shadow p-5 border border-gray-200 mb-4">
+                        <div class="flex justify-between items-start">
+                            <div>
+                                <h3 class="font-bold text-lg" x-text="tier.name"></h3>
+                                <p class="text-gray-500 text-sm"><span x-text="tier.available"></span> / <span x-text="tier.quantity"></span> remaining</p>
+                            </div>
+                            <p class="text-xl font-bold text-blue-700">$<span x-text="tier.price.toFixed(2)"></span></p>
+                        </div>
+
+                        <template x-if="tier.available > 0">
+                            <form @submit.prevent="purchaseTickets(tier)" class="mt-4 grid grid-cols-2 gap-3">
+                                <input type="text" placeholder="Your Name" x-model="tier._name" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <input type="email" placeholder="Your Email" x-model="tier._email" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <input type="number" min="1" :max="Math.min(tier.available, 10)" value="1" x-model="tier._qty" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <input type="text" placeholder="Card # (any 16 digits)" x-model="tier._card" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <button type="submit" class="col-span-2 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg text-sm font-medium transition">
+                                    Buy Now — $<span x-text="(tier.price * (tier._qty || 1)).toFixed(2)"></span>
+                                </button>
+                            </form>
+                        </template>
+                        <template x-if="tier.available <= 0">
+                            <p class="text-red-600 font-semibold mt-2">Sold Out</p>
+                        </template>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: CONFIRMATION ===== -->
+        <template x-if="view === 'confirmation'">
+            <div>
+                <div class="bg-green-50 border-2 border-green-400 rounded-xl shadow p-6 text-center">
+                    <h1 class="text-2xl font-bold text-green-700">✅ Purchase Confirmed!</h1>
+                    <p class="text-lg mt-2">Thank you, <span class="font-semibold" x-text="lastOrder.buyer_name"></span>!</p>
+                    <p class="mt-1">You purchased <strong x-text="lastOrder.quantity"></strong> × <strong x-text="lastOrder.tier_name"></strong></p>
+                    <p class="text-2xl font-bold text-blue-700 mt-2">$<span x-text="lastOrder.total.toFixed(2)"></span></p>
+                </div>
+
+                <div class="bg-white rounded-xl shadow p-5 border border-gray-200 mt-4">
+                    <h2 class="font-bold text-lg">Your Tickets</h2>
+                    <p class="text-gray-500 text-sm mb-3">Show these codes at the door for entry.</p>
+                    <template x-for="(code, idx) in lastOrder.codes" :key="idx">
+                        <div class="border-2 border-dashed border-gray-300 rounded-lg p-4 mb-3 text-center">
+                            <p class="ticket-code text-lg font-bold text-blue-800" x-text="code"></p>
+                            <div class="w-36 h-36 bg-gray-100 mx-auto mt-2 flex items-center justify-center rounded-lg border border-gray-200">
+                                <span class="text-gray-400 text-xs">[QR Code Placeholder]</span>
+                            </div>
+                            <p class="text-xs text-gray-400 mt-1">Status: Not Yet Used</p>
+                        </div>
+                    </template>
+                </div>
+
+                <div class="bg-white rounded-xl shadow p-5 border border-gray-200 mt-4">
+                    <p><strong>Event:</strong> <span x-text="lastOrder.event_title"></span></p>
+                    <p><strong>📍</strong> <span x-text="lastOrder.venue"></span> | <strong>📅</strong> <span x-text="lastOrder.date"></span> @ <span x-text="lastOrder.time"></span></p>
+                </div>
+
+                <button @click="view = 'events'" class="mt-4 bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg">Browse More Events</button>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: ORGANIZER REGISTER ===== -->
+        <template x-if="view === 'org-register'">
+            <div class="max-w-md mx-auto">
+                <div class="bg-white rounded-xl shadow p-6 border border-gray-200">
+                    <h1 class="text-xl font-bold mb-4">Organizer Registration</h1>
+                    <form @submit.prevent="registerOrg">
+                        <div class="mb-3">
+                            <label class="block text-sm font-medium mb-1">Name</label>
+                            <input type="text" x-model="regForm.name" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <div class="mb-3">
+                            <label class="block text-sm font-medium mb-1">Email</label>
+                            <input type="email" x-model="regForm.email" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium mb-1">Password</label>
+                            <input type="password" x-model="regForm.password" minlength="4" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium">Register</button>
+                    </form>
+                    <p class="text-sm text-center mt-3">Already have an account? <a href="#" @click="view = 'org-login'" class="text-blue-600 underline">Login</a></p>
+                </div>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: ORGANIZER LOGIN ===== -->
+        <template x-if="view === 'org-login'">
+            <div class="max-w-md mx-auto">
+                <div class="bg-white rounded-xl shadow p-6 border border-gray-200">
+                    <h1 class="text-xl font-bold mb-4">Organizer Login</h1>
+                    <form @submit.prevent="loginOrg">
+                        <div class="mb-3">
+                            <label class="block text-sm font-medium mb-1">Email</label>
+                            <input type="email" x-model="loginForm.email" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <div class="mb-4">
+                            <label class="block text-sm font-medium mb-1">Password</label>
+                            <input type="password" x-model="loginForm.password" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg font-medium">Login</button>
+                    </form>
+                    <p class="text-sm text-center mt-3">Don't have an account? <a href="#" @click="view = 'org-register'" class="text-blue-600 underline">Register</a></p>
+                </div>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: ORGANIZER DASHBOARD ===== -->
+        <template x-if="view === 'org-dashboard'">
+            <div>
+                <div class="flex justify-between items-center mb-4">
+                    <h1 class="text-2xl font-bold">My Events</h1>
+                    <button @click="view = 'create-event'" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-medium">+ Create Event</button>
+                </div>
+
+                <template x-if="myEvents.length === 0">
+                    <div class="bg-white rounded-xl shadow p-8 text-center text-gray-500">
+                        <p>You haven't created any events yet.</p>
+                        <button @click="view = 'create-event'" class="mt-3 bg-green-600 hover:bg-green-700 text-white px-5 py-2 rounded-lg">Create Your First Event</button>
+                    </div>
+                </template>
+
+                <template x-if="myEvents.length > 0">
+                    <div class="overflow-x-auto bg-white rounded-xl shadow border border-gray-200">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="text-left px-4 py-3 font-medium">Event</th>
+                                    <th class="text-left px-4 py-3 font-medium">Date</th>
+                                    <th class="text-center px-4 py-3 font-medium">Sold</th>
+                                    <th class="text-center px-4 py-3 font-medium">Checked In</th>
+                                    <th class="text-right px-4 py-3 font-medium">Revenue</th>
+                                    <th class="text-center px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="evt in myEvents" :key="evt.id">
+                                    <tr class="border-t border-gray-100 hover:bg-gray-50">
+                                        <td class="px-4 py-3">
+                                            <span class="font-medium" x-text="evt.title"></span><br>
+                                            <span class="text-gray-400 text-xs" x-text="evt.venue"></span>
+                                        </td>
+                                        <td class="px-4 py-3" x-text="evt.date"></td>
+                                        <td class="px-4 py-3 text-center" x-text="`${evt._sold} / ${evt.total_capacity}`"></td>
+                                        <td class="px-4 py-3 text-center" x-text="evt._checkedIn"></td>
+                                        <td class="px-4 py-3 text-right font-medium">$<span x-text="evt._revenue.toFixed(2)"></span></td>
+                                        <td class="px-4 py-3 text-center">
+                                            <button @click="viewEvent(evt.id)" class="text-blue-600 hover:underline text-xs">Manage</button>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: CREATE EVENT ===== -->
+        <template x-if="view === 'create-event'">
+            <div class="max-w-2xl mx-auto">
+                <div class="bg-white rounded-xl shadow p-6 border border-gray-200">
+                    <h1 class="text-xl font-bold mb-4">Create New Event</h1>
+                    <form @submit.prevent="createEvent">
+                        <div class="mb-3">
+                            <label class="block text-sm font-medium mb-1">Event Title</label>
+                            <input type="text" x-model="eventForm.title" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                        </div>
+                        <div class="mb-3">
+                            <label class="block text-sm font-medium mb-1">Description</label>
+                            <textarea x-model="eventForm.description" rows="2" class="w-full border border-gray-300 rounded-lg px-3 py-2"></textarea>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div class="mb-3">
+                                <label class="block text-sm font-medium mb-1">Venue</label>
+                                <input type="text" x-model="eventForm.venue" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                            </div>
+                            <div class="mb-3">
+                                <label class="block text-sm font-medium mb-1">Total Capacity</label>
+                                <input type="number" x-model="eventForm.capacity" min="1" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                            </div>
+                            <div class="mb-3">
+                                <label class="block text-sm font-medium mb-1">Date</label>
+                                <input type="date" x-model="eventForm.date" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                            </div>
+                            <div class="mb-3">
+                                <label class="block text-sm font-medium mb-1">Time</label>
+                                <input type="time" x-model="eventForm.time" required class="w-full border border-gray-300 rounded-lg px-3 py-2">
+                            </div>
+                        </div>
+
+                        <hr class="my-4">
+                        <h3 class="font-bold mb-2">Ticket Tiers</h3>
+                        <p class="text-gray-500 text-xs mb-3">Add at least one tier (e.g., "GA" at $49.99)</p>
+
+                        <template x-for="(tier, i) in eventForm.tiers" :key="i">
+                            <div class="grid grid-cols-3 gap-2 mb-2">
+                                <input type="text" placeholder="Tier Name" x-model="tier.name" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <input type="number" placeholder="Price" x-model="tier.price" step="0.01" min="0" required
+                                       class="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                <div class="flex gap-1">
+                                    <input type="number" placeholder="Qty" x-model="tier.qty" min="1" required
+                                           class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                                    <button type="button" @click="eventForm.tiers.splice(i,1)" x-show="eventForm.tiers.length > 1"
+                                            class="text-red-500 hover:text-red-700 px-2 text-lg">&times;</button>
+                                </div>
+                            </div>
+                        </template>
+
+                        <button type="button" @click="eventForm.tiers.push({name:'', price:'', qty:''})" class="text-blue-600 hover:underline text-sm">+ Add Another Tier</button>
+
+                        <hr class="my-4">
+                        <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-lg font-bold text-lg transition">
+                            Create Event
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </template>
+
+        <!-- ===== VIEW: CHECK-IN ===== -->
+        <template x-if="view === 'checkin'">
+            <div class="max-w-lg mx-auto">
+                <div class="bg-white rounded-xl shadow p-6 border border-gray-200 text-center">
+                    <h1 class="text-xl font-bold mb-1">🎟️ Ticket Check-in</h1>
+                    <p class="text-gray-500 text-sm mb-4">Enter the ticket code to validate entry</p>
+                    <form @submit.prevent="checkInTicket">
+                        <input type="text" x-model="checkinCode" placeholder="e.g., TM-..."
+                               class="w-full text-center text-lg font-mono border border-gray-300 rounded-lg px-4 py-3 mb-3"
+                               autofocus>
+                        <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white py-3 rounded-lg font-bold text-lg transition">
+                            ✅ Validate Ticket
+                        </button>
+                    </form>
+
+                    <template x-if="checkinResult">
+                        <div class="mt-4 p-4 rounded-lg border-2 text-left"
+                             :class="checkinResult.success ? 'bg-green-50 border-green-400' : 'bg-red-50 border-red-400'">
+                            <p class="font-bold" :class="checkinResult.success ? 'text-green-700' : 'text-red-700'"
+                               x-text="checkinResult.message"></p>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+    </div><!-- /container -->
+</div>
+
+<script>
+function app() {
+    return {
+        // ── State ──
+        view: 'events',
+        flashes: [],
+
+        // Data
+        events: [],
+        organizers: [],
+        currentEvent: null,
+        currentTiers: [],
+        lastOrder: null,
+        myEvents: [],
+
+        // Auth
+        organizer: JSON.parse(localStorage.getItem('tm_organizer') || 'null'),
+
+        // Forms
+        regForm: { name: '', email: '', password: '' },
+        loginForm: { email: '', password: '' },
+        eventForm: {
+            title: '', description: '', venue: '', capacity: '',
+            date: '', time: '', tiers: [{ name: 'General Admission', price: '49.99', qty: '100' }]
+        },
+        checkinCode: '',
+        checkinResult: null,
+
+        // ── Init ──
+        init() {
+            this.loadData();
+            if (this.organizer) this.refreshMyEvents();
+        },
+
+        loadData() {
+            try {
+                const raw = localStorage.getItem('tm_data');
+                if (raw) {
+                    const data = JSON.parse(raw);
+                    this.events = data.events || [];
+                    this.organizers = data.organizers || [];
+                } else {
+                    // Seed demo data
+                    this.events = [];
+                    this.organizers = [];
+                    this.saveData();
+                }
+            } catch(e) { console.error('Load error', e); }
+        },
+
+        saveData() {
+            localStorage.setItem('tm_data', JSON.stringify({
+                events: this.events,
+                organizers: this.organizers
+            }));
+        },
+
+        flash(text, type = 'success') {
+            this.flashes.push({ text, type });
+            setTimeout(() => { this.flashes.shift(); }, 4000);
+        },
+
+        // ── IDs ──
+        nextId(arr) {
+            return arr.length ? Math.max(...arr.map(x => x.id)) + 1 : 1;
+        },
+
+        // ── Auth ──
+        registerOrg() {
+            const exists = this.organizers.find(o => o.email === this.regForm.email);
+            if (exists) { this.flash('Email already registered', 'error'); return; }
+            const org = {
+                id: this.nextId(this.organizers),
+                name: this.regForm.name,
+                email: this.regForm.email,
+                password: this.regForm.password // MVP only — hash in production
+            };
+            this.organizers.push(org);
+            this.saveData();
+            this.organizer = org;
+            localStorage.setItem('tm_organizer', JSON.stringify(org));
+            this.flash('Registration successful!');
+            this.view = 'org-dashboard';
+            this.refreshMyEvents();
+        },
+
+        loginOrg() {
+            const org = this.organizers.find(o => o.email === this.loginForm.email && o.password === this.loginForm.password);
+            if (!org) { this.flash('Invalid email or password', 'error'); return; }
+            this.organizer = org;
+            localStorage.setItem('tm_organizer', JSON.stringify(org));
+            this.flash('Login successful!');
+            this.view = 'org-dashboard';
+            this.refreshMyEvents();
+        },
+
+        logout() {
+            this.organizer = null;
+            localStorage.removeItem('tm_organizer');
+            this.myEvents = [];
+            this.flash('Logged out');
+            this.view = 'events';
+        },
+
+        refreshMyEvents() {
+            if (!this.organizer) return;
+            this.myEvents = this.events
+                .filter(e => e.organizer_id === this.organizer.id)
+                .map(e => {
+                    const sold = e.tiers ? e.tiers.reduce((s, t) => s + (t.sold || 0), 0) : 0;
+                    let checkedIn = 0;
+                    let revenue = 0;
+                    if (e.orders) {
+                        checkedIn = e.orders.reduce((s, o) => s + (o._checkedIn || 0), 0);
+                        revenue = e.orders.reduce((s, o) => s + (o.total || 0), 0);
+                    }
+                    return { ...e, _sold: sold, _checkedIn: checkedIn, _revenue: revenue };
+                });
+        },
+
+        // ── Events ──
+        viewEvent(id) {
+            const evt = this.events.find(e => e.id === id);
+            if (!evt) return;
+            this.currentEvent = evt;
+            this.currentTiers = (evt.tiers || []).map(t => ({
+                ...t,
+                _name: '',
+                _email: '',
+                _qty: 1,
+                _card: '',
+                available: t.quantity - (t.sold || 0)
+            }));
+            this.view = 'event-detail';
+        },
+
+        createEvent() {
+            if (!this.organizer) { this.flash('You must be logged in', 'error'); return; }
+            const f = this.eventForm;
+            const tiers = f.tiers.map(t => ({
+                id: this.nextId([]),
+                name: t.name,
+                price: parseFloat(t.price),
+                quantity: parseInt(t.qty),
+                sold: 0
+            }));
+            const totalTickets = tiers.reduce((s, t) => s + t.quantity, 0);
+
+            const evt = {
+                id: this.nextId(this.events),
+                organizer_id: this.organizer.id,
+                organizer_name: this.organizer.name,
+                title: f.title,
+                description: f.description,
+                venue: f.venue,
+                date: f.date,
+                time: f.time,
+                total_capacity: parseInt(f.capacity),
+                tiers: tiers,
+                orders: [],
+                created_at: new Date().toISOString()
+            };
+
+            this.events.push(evt);
+            this.saveData();
+            this.flash('Event created successfully!');
+            this.eventForm = { title: '', description: '', venue: '', capacity: '', date: '', time: '', tiers: [{ name: 'General Admission', price: '49.99', qty: '100' }] };
+            this.refreshMyEvents();
+            this.view = 'org-dashboard';
+        },
+
+        // ── Purchases ──
+        purchaseTickets(tier) {
+            const evt = this.currentEvent;
+            if (!tier._name || !tier._email || !tier._card || !tier._qty) {
+                this.flash('Please fill in all fields', 'error'); return;
+            }
+            const qty = parseInt(tier._qty);
+            if (qty < 1 || qty > Math.min(tier.available, 10)) {
+                this.flash(`Quantity must be 1-${Math.min(tier.available, 10)}`, 'error'); return;
+            }
+            const card = tier._card.replace(/[\s-]/g, '');
+            if (card.length < 13 || card.length > 19) {
+                this.flash('Invalid card number', 'error'); return;
+            }
+
+            // Generate ticket codes
+            const codes = [];
+            for (let i = 0; i < qty; i++) {
+                codes.push('TM-' + Array.from({length: 16}, () => Math.floor(Math.random()*16).toString(16).toUpperCase()).join(''));
+            }
+
+            // Update tier
+            tier.sold = (tier.sold || 0) + qty;
+            tier.available = tier.quantity - tier.sold;
+
+            // Create order
+            const order = {
+                id: this.nextId(evt.orders || []),
+                buyer_name: tier._name,
+                buyer_email: tier._email,
+                tier_id: tier.id,
+                tier_name: tier.name,
+                quantity: qty,
+                total: qty * tier.price,
+                codes: codes,
+                event_title: evt.title,
+                venue: evt.venue,
+                date: evt.date,
+                time: evt.time,
+                date_created: new Date().toISOString()
+            };
+
+            if (!evt.orders) evt.orders = [];
+            evt.orders.push(order);
+
+            this.saveData();
+            this.lastOrder = order;
+            this.flash(`Purchased ${qty} × ${tier.name}!`);
+            this.view = 'confirmation';
+        },
+
+        // ── Check-in ──
+        checkInTicket() {
+            this.checkinResult = null;
+            const code = this.checkinCode.trim().toUpperCase();
+            if (!code) { this.checkinResult = { success: false, message: 'Please enter a ticket code' }; return; }
+
+            // Search all events for this code
+            for (const evt of this.events) {
+                if (!evt.orders) continue;
+                for (const order of evt.orders) {
+                    const idx = order.codes.indexOf(code);
+                    if (idx !== -1) {
+                        if (order._checkedIn === undefined) order._checkedIn = 0;
+
+                        // Check if already checked in via another code in same order
+                        // Use a simple flag approach: store checked codes
+                        if (!evt._checkedCodes) evt._checkedCodes = [];
+                        if (evt._checkedCodes.includes(code)) {
+                            this.checkinResult = { success: false, message: `Ticket ${code} was already checked in!` };
+                            this.saveData();
+                            return;
+                        }
+
+                        evt._checkedCodes.push(code);
+                        order._checkedIn = (order._checkedIn || 0) + 1;
+                        this.saveData();
+                        this.checkinResult = {
+                            success: true,
+                            message: `✅ Check-in successful! ${order.tier_name} — ${evt.title} (${order.buyer_name})`
+                        };
+                        this.checkinCode = '';
+                        this.refreshMyEvents();
+                        return;
+                    }
+                }
+            }
+
+            this.checkinResult = { success: false, message: `❌ Invalid ticket code: ${code}` };
+        }
+    };
+}
+</script>
+
+</body>
+</html>
